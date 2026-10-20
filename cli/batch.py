@@ -19,9 +19,10 @@ from .github import (
     search_prs,
     update_complexity_label,
 )
+from . import sources
 from .csv_handler import CSVBatchWriter
 from .io_safety import normalize_path, read_text_file
-from .utils import parse_pr_url
+from .sources import resolve_pr_ref
 
 # Get logger
 logger = logging.getLogger("complexity-cli")
@@ -591,6 +592,7 @@ def run_batch_analysis_with_labels(
     label_prs: bool = False,
     label_prefix: str = "complexity:",
     github_token: Optional[str] = None,
+    ado_pat: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT,
     force: bool = False,
 ) -> None:
@@ -605,8 +607,9 @@ def run_batch_analysis_with_labels(
         workers: Number of parallel workers (1 = sequential, >1 = parallel)
         label_prs: If True, label PRs with complexity instead of (or in addition to) CSV
         label_prefix: Prefix for complexity labels
-        github_token: GitHub token (required for labeling)
-        timeout: Timeout for GitHub API calls
+        github_token: GitHub token (required for labeling GitHub PRs)
+        ado_pat: Azure DevOps PAT (required for labeling Azure DevOps PRs)
+        timeout: Timeout for forge API calls
         force: If True, re-analyze PRs even if they already have a complexity label
     """
     # When labeling (and not forcing), filter out PRs that already have complexity labels
@@ -622,10 +625,18 @@ def run_batch_analysis_with_labels(
                 typer.echo(f"  Checked {idx}/{len(pr_urls)} PRs...", err=True)
 
             try:
-                owner, repo, pr = parse_pr_url(pr_url)
-                existing_label = has_complexity_label(
-                    owner, repo, pr, github_token, label_prefix, timeout
-                )
+                ref = resolve_pr_ref(pr_url, ado_pat=ado_pat)
+                if ref.source == "azure-devops":
+                    existing_label = sources.has_complexity_label(
+                        ref,
+                        github_token=github_token,
+                        label_prefix=label_prefix,
+                        timeout=timeout,
+                    )
+                else:
+                    existing_label = has_complexity_label(
+                        ref.owner, ref.repo, ref.pr, github_token, label_prefix, timeout
+                    )
                 if existing_label:
                     already_labeled += 1
                 else:
@@ -692,12 +703,22 @@ def run_batch_analysis_with_labels(
 
             label_applied = None
 
-            # Apply label if requested
-            if label_prs and github_token:
-                owner, repo, pr = parse_pr_url(pr_url)
-                label_applied = update_complexity_label(
-                    owner, repo, pr, complexity, github_token, label_prefix, timeout
-                )
+            # Apply label if requested (GitHub PRs need a GitHub token,
+            # Azure DevOps PRs need a PAT)
+            if label_prs and (github_token or ado_pat):
+                ref = resolve_pr_ref(pr_url, ado_pat=ado_pat)
+                if ref.source == "azure-devops":
+                    label_applied = sources.update_complexity_label(
+                        ref,
+                        complexity,
+                        github_token=github_token,
+                        label_prefix=label_prefix,
+                        timeout=timeout,
+                    )
+                else:
+                    label_applied = update_complexity_label(
+                        ref.owner, ref.repo, ref.pr, complexity, github_token, label_prefix, timeout
+                    )
 
             return pr_url, complexity, explanation, label_applied, None
         except Exception as e:

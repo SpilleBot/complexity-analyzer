@@ -6,16 +6,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from .config import (
-    validate_owner_repo,
-    validate_pr_number,
-)
 from .config_types import AnalysisConfig
 from .github import fetch_pr, fetch_pr_with_rotation
 from .io_safety import read_text_file
 from .llm import get_provider, resolve_provider
 from .preprocess import make_prompt_input, process_diff
-from .utils import parse_pr_url
+from . import sources
+from .sources import resolve_pr_ref
 
 _SYNC_TITLE_RE = re.compile(
     r"synced (?:local )?file\(s\)",
@@ -118,6 +115,7 @@ def analyze_single_pr(
         openai_api_key=config.openai_key,
         gemini_api_key=config.gemini_key,
         anthropic_api_key=config.anthropic_key,
+        kimi_api_key=config.kimi_key,
         model=config.model,
     )
 
@@ -129,35 +127,43 @@ def analyze_single_pr(
         timeout=config.timeout,
     )
 
-    # Parse PR URL
-    owner, repo, pr = parse_pr_url(pr_url)
-    validate_owner_repo(owner, repo)
-    validate_pr_number(pr)
+    # Resolve PR reference (GitHub or Azure DevOps) from the URL
+    ref = resolve_pr_ref(pr_url, source=config.source, ado_pat=config.ado_pat)
 
     # Load prompt if not provided
     prompt_text = config.prompt_text
     if not prompt_text:
         prompt_text = load_prompt()
 
-    # Fetch PR - use token rotator if available, otherwise use single token
-    if config.token_rotator:
-        diff_text, meta = fetch_pr_with_rotation(
-            owner,
-            repo,
-            pr,
-            config.token_rotator,
+    # Fetch PR - use token rotator for GitHub when available, otherwise
+    # dispatch to the forge-specific client (GitHub or Azure DevOps).
+    if ref.source == "github":
+        if config.token_rotator:
+            diff_text, meta = fetch_pr_with_rotation(
+                ref.owner,
+                ref.repo,
+                ref.pr,
+                config.token_rotator,
+                sleep_s=config.sleep_seconds,
+                progress_callback=progress_callback,
+                timeout=config.timeout,
+            )
+        else:
+            diff_text, meta = fetch_pr(
+                ref.owner,
+                ref.repo,
+                ref.pr,
+                config.github_token,
+                sleep_s=config.sleep_seconds,
+                progress_callback=progress_callback,
+            )
+    else:
+        diff_text, meta = sources.fetch_pr(
+            ref,
+            github_token=config.github_token,
             sleep_s=config.sleep_seconds,
             progress_callback=progress_callback,
             timeout=config.timeout,
-        )
-    else:
-        diff_text, meta = fetch_pr(
-            owner,
-            repo,
-            pr,
-            config.github_token,
-            sleep_s=config.sleep_seconds,
-            progress_callback=progress_callback,
         )
 
     title = (meta.get("title") or "").strip()
@@ -174,8 +180,8 @@ def analyze_single_pr(
             "model": "sync-shortcircuit",
             "tokens": None,
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "repo": f"{owner}/{repo}",
-            "pr": pr,
+            "repo": ref.repo_slug,
+            "pr": ref.pr,
             "url": pr_url,
             "title": title,
         }
@@ -204,8 +210,8 @@ def analyze_single_pr(
         "model": result.get("model", provider_inst.model_name),
         "tokens": result.get("tokens"),
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "repo": f"{owner}/{repo}",
-        "pr": pr,
+        "repo": ref.repo_slug,
+        "pr": ref.pr,
         "url": pr_url,
         "title": title,
     }
@@ -231,30 +237,37 @@ def handle_dry_run(
         ValueError: If PR URL is invalid
         GitHubAPIError: If GitHub API call fails
     """
-    # Parse PR URL
-    owner, repo, pr = parse_pr_url(pr_url)
-    validate_owner_repo(owner, repo)
-    validate_pr_number(pr)
+    # Resolve PR reference (GitHub or Azure DevOps) from the URL
+    ref = resolve_pr_ref(pr_url, source=config.source, ado_pat=config.ado_pat)
 
     # Fetch PR
-    if config.token_rotator:
-        diff_text, meta = fetch_pr_with_rotation(
-            owner,
-            repo,
-            pr,
-            config.token_rotator,
+    if ref.source == "github":
+        if config.token_rotator:
+            diff_text, meta = fetch_pr_with_rotation(
+                ref.owner,
+                ref.repo,
+                ref.pr,
+                config.token_rotator,
+                sleep_s=config.sleep_seconds,
+                progress_callback=progress_callback,
+                timeout=config.timeout,
+            )
+        else:
+            diff_text, meta = fetch_pr(
+                ref.owner,
+                ref.repo,
+                ref.pr,
+                config.github_token,
+                sleep_s=config.sleep_seconds,
+                progress_callback=progress_callback,
+            )
+    else:
+        diff_text, meta = sources.fetch_pr(
+            ref,
+            github_token=config.github_token,
             sleep_s=config.sleep_seconds,
             progress_callback=progress_callback,
             timeout=config.timeout,
-        )
-    else:
-        diff_text, meta = fetch_pr(
-            owner,
-            repo,
-            pr,
-            config.github_token,
-            sleep_s=config.sleep_seconds,
-            progress_callback=progress_callback,
         )
 
     title = (meta.get("title") or "").strip()
@@ -271,8 +284,8 @@ def handle_dry_run(
         "selected_files_count": len(selected_files),
         "selected_files": selected_files,
         "stats": stats,
-        "repo": f"{owner}/{repo}",
-        "pr": pr,
+        "repo": ref.repo_slug,
+        "pr": ref.pr,
         "url": pr_url,
     }
 

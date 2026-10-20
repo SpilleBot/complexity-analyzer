@@ -33,11 +33,18 @@ class AnalysisConfig:
     # LLM provider selection
     provider: str = "auto"
 
+    # PR source (forge) selection: auto-detect from URL by default
+    source: str = "auto"
+
     # Credentials (optional - can be provided at runtime)
     github_token: Optional[str] = None
     openai_key: Optional[str] = None
     gemini_key: Optional[str] = None
     anthropic_key: Optional[str] = None
+    kimi_key: Optional[str] = None
+
+    # Azure DevOps personal access token (optional)
+    ado_pat: Optional[str] = None
 
     # Token rotation (optional)
     token_rotator: Optional["TokenRotator"] = None
@@ -57,9 +64,14 @@ class AnalysisConfig:
             raise ValueError(f"sleep_seconds cannot be negative, got {self.sleep_seconds}")
         if not self.model or not self.model.strip():
             raise ValueError("model cannot be empty")
-        if self.provider not in ("auto", "gemini", "openai", "anthropic"):
+        if self.provider not in ("auto", "gemini", "openai", "anthropic", "kimi"):
             raise ValueError(
-                f"provider must be 'auto', 'gemini', 'openai', or 'anthropic', got '{self.provider}'"
+                f"provider must be 'auto', 'gemini', 'openai', 'anthropic', or 'kimi', "
+                f"got '{self.provider}'"
+            )
+        if self.source not in ("auto", "github", "azure-devops"):
+            raise ValueError(
+                f"source must be 'auto', 'github', or 'azure-devops', got '{self.source}'"
             )
 
     @classmethod
@@ -69,6 +81,7 @@ class AnalysisConfig:
             get_anthropic_api_key,
             get_gemini_api_key,
             get_github_token,
+            get_kimi_api_key,
             get_openai_api_key,
         )
 
@@ -76,6 +89,7 @@ class AnalysisConfig:
         kwargs.setdefault("openai_key", get_openai_api_key())
         kwargs.setdefault("gemini_key", get_gemini_api_key())
         kwargs.setdefault("anthropic_key", get_anthropic_api_key())
+        kwargs.setdefault("kimi_key", get_kimi_api_key())
         return cls(**kwargs)
 
 

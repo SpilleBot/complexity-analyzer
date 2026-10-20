@@ -13,29 +13,35 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.providers.anthropic import AnthropicProvider as PydanticAnthropicProvider
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider as PydanticOpenAIProvider
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 
 from .config import (
     get_anthropic_api_key,
     get_anthropic_base_url,
     get_gemini_api_key,
+    get_kimi_api_key,
     get_openai_api_key,
     get_openai_base_url,
 )
 from .constants import (
     DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_KIMI_MAX_COMPLETION_TOKENS,
+    DEFAULT_KIMI_MODEL,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MODEL,
     DEFAULT_RETRY_DELAY,
     DEFAULT_TIMEOUT,
+    KIMI_BASE_URL,
 )
 from .llm_base import LLMProvider
-from .scoring import ComplexityResult
+from .scoring import ComplexityResult, parse_complexity_response
 
 _GEMINI_PREFIXES = ("gemini:", "google-gla:", "google-vertex:", "google:")
 _OPENAI_PREFIXES = ("openai:", "openai-chat:")
 _ANTHROPIC_PREFIXES = ("anthropic:", "claude:")
+_KIMI_PREFIXES = ("kimi:", "moonshot:")
 
 # PydanticAI's `RequestUsage.extract` delegates to genai-prices, which for OpenAI
 # chat completions can return an `output_reasoning_tokens` field that isn't a
@@ -369,6 +375,142 @@ class AnthropicProvider(PydanticAIProvider):
         )
 
 
+class KimiProvider(PydanticAIProvider):
+    """Kimi (Moonshot AI) provider implementation using PydanticAI.
+
+    Kimi exposes an OpenAI-compatible Chat Completions API
+    (``https://api.moonshot.ai/v1``), so this provider reuses the OpenAI
+    machinery. Model names must NOT contain ``-luna``: those are routed to the
+    Responses API (``/v1/responses``), which Kimi does not serve.
+
+    If the structured-output (function calling) request fails, a text-mode
+    fallback asks the model for a plain JSON object and parses it with the
+    scoring module's parser.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = DEFAULT_KIMI_MODEL,
+        timeout: float = DEFAULT_TIMEOUT,
+        base_url: Optional[str] = None,
+        retries: int = DEFAULT_MAX_RETRIES,
+    ):
+        """Initialize Kimi provider."""
+        resolved_key = api_key or get_kimi_api_key()
+        if not resolved_key:
+            raise LLMError(
+                "Missing API key for Kimi provider. Set KIMI_API_KEY or MOONSHOT_API_KEY."
+            )
+        # NB: an explicit base_url wins; otherwise always use the public
+        # Moonshot API. The KIMI_BASE_URL environment variable is NOT honored
+        # here — it is set by the Kimi Code CLI to its own coding gateway
+        # (agent-gw.kimi.com), which does not serve this API shape.
+        resolved_base_url = base_url or KIMI_BASE_URL
+        model_str = _strip_prefix(model or DEFAULT_KIMI_MODEL, _KIMI_PREFIXES)
+        super().__init__(
+            provider="openai",
+            api_key=resolved_key,
+            model=model_str,
+            timeout=timeout,
+            base_url=resolved_base_url,
+            retries=retries,
+        )
+        # Moonshot's thinking-enabled models reject tool_choice "required"
+        # while thinking is on. For models where thinking can be switched off
+        # (kimi-k2.6) disable it via extra_body so structured output (function
+        # calling) works directly. The k2.7-code family REQUIRES thinking
+        # enabled, so leave it on there; such requests still go through the
+        # text-mode fallback agent. Cap the completion length with
+        # max_completion_tokens (the OpenAI-chat field Moonshot expects).
+        thinking_type = "enabled" if "k2.7" in model_str else "disabled"
+        kimi_model_settings = ModelSettings(
+            extra_body={
+                "thinking": {"type": thinking_type},
+                "max_completion_tokens": DEFAULT_KIMI_MAX_COMPLETION_TOKENS,
+            }
+        )
+        self._agent = Agent(
+            self._model_instance,
+            output_type=ComplexityResult,
+            retries=retries,
+            model_settings=kimi_model_settings,
+        )
+        # Text-mode fallback agent (no structured output) for providers/models
+        # where function calling is unavailable or rejected.
+        self._fallback_agent = Agent(
+            self._model_instance, retries=retries, model_settings=kimi_model_settings
+        )
+
+    def analyze_complexity(
+        self,
+        prompt: str,
+        diff_excerpt: str,
+        stats_json: str,
+        title: str,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
+    ) -> Dict[str, Any]:
+        """
+        Analyze PR complexity, with a text-mode JSON fallback.
+
+        Tries the standard structured-output path first; if that fails (e.g.
+        the model rejects function tools), falls back to plain text generation
+        parsed by :func:`cli.scoring.parse_complexity_response`.
+        """
+        try:
+            return super().analyze_complexity(
+                prompt=prompt,
+                diff_excerpt=diff_excerpt,
+                stats_json=stats_json,
+                title=title,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+        except LLMError as structured_error:
+            return self._analyze_text_fallback(
+                prompt, diff_excerpt, stats_json, title, structured_error
+            )
+
+    def _analyze_text_fallback(
+        self,
+        prompt: str,
+        diff_excerpt: str,
+        stats_json: str,
+        title: str,
+        structured_error: LLMError,
+    ) -> Dict[str, Any]:
+        """Fallback: plain-text generation parsed as a complexity JSON object."""
+        user_prompt = (
+            f"diff_excerpt:\n{diff_excerpt}\n\nstats_json:\n{stats_json}\n\ntitle:\n{title}"
+            "\n\nRespond with a JSON object only, in exactly this format:"
+            ' {"complexity": <integer 1-10>, "explanation": "<short explanation>"}'
+        )
+        try:
+            result = self._fallback_agent.run_sync(user_prompt, instructions=prompt)
+            parsed = parse_complexity_response(str(result.output))
+            tokens = None
+            try:
+                usage = result.usage()
+                total = getattr(usage, "total_tokens", None)
+                if isinstance(total, (int, float)) and total > 0:
+                    tokens = int(total)
+            except Exception:
+                tokens = None
+            return {
+                "complexity": parsed["complexity"],
+                "explanation": parsed["explanation"],
+                "provider": self.provider_name,
+                "model": self.model_name,
+                "tokens": tokens,
+            }
+        except Exception as fallback_error:
+            raise LLMError(
+                f"kimi structured output failed: {structured_error}; "
+                f"text fallback failed: {fallback_error}"
+            ) from fallback_error
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
     """Specification for an LLM provider."""
@@ -402,6 +544,13 @@ PROVIDER_SPECS: Dict[str, ProviderSpec] = {
         env_var_keys=("ANTHROPIC_API_KEY",),
         aliases=("claude",),
     ),
+    "kimi": ProviderSpec(
+        name="kimi",
+        provider_cls=KimiProvider,
+        default_model=DEFAULT_KIMI_MODEL,
+        env_var_keys=("KIMI_API_KEY", "MOONSHOT_API_KEY"),
+        aliases=("moonshot",),
+    ),
 }
 
 DEFAULT_PROVIDER_PRECEDENCE: tuple[str, ...] = ("openai", "gemini", "anthropic")
@@ -423,9 +572,11 @@ def resolve_provider_credentials(
     openai_api_key: Optional[str] = None,
     gemini_api_key: Optional[str] = None,
     anthropic_api_key: Optional[str] = None,
+    kimi_api_key: Optional[str] = None,
     env_openai_api_key: Optional[str] = None,
     env_gemini_api_key: Optional[str] = None,
     env_anthropic_api_key: Optional[str] = None,
+    env_kimi_api_key: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """
     Resolve provider credentials and perform fast pre-flight auth validation.
@@ -441,6 +592,7 @@ def resolve_provider_credentials(
     openai_env = env_openai_api_key or get_openai_api_key()
     gemini_env = env_gemini_api_key or get_gemini_api_key()
     anthropic_env = env_anthropic_api_key or get_anthropic_api_key()
+    kimi_env = env_kimi_api_key or get_kimi_api_key()
 
     if prov_norm == "auto":
         # Check explicit CLI argument overrides first
@@ -453,23 +605,33 @@ def resolve_provider_credentials(
         elif anthropic_api_key:
             effective_prov = "anthropic"
             effective_key = anthropic_api_key
+        elif kimi_api_key:
+            effective_prov = "kimi"
+            effective_key = kimi_api_key
         else:
-            # Auto-detect using DEFAULT_PROVIDER_PRECEDENCE ("openai", "gemini", "anthropic")
+            # Auto-detect using DEFAULT_PROVIDER_PRECEDENCE
             effective_prov = None
             effective_key = None
             env_keys = {
                 "openai": openai_env,
                 "gemini": gemini_env,
                 "anthropic": anthropic_env,
+                "kimi": kimi_env,
             }
             for p_name in DEFAULT_PROVIDER_PRECEDENCE:
                 if env_keys.get(p_name):
                     effective_prov = p_name
                     effective_key = env_keys[p_name]
                     break
+            if not effective_prov and kimi_env:
+                # Kimi is lowest precedence in auto mode to preserve the
+                # original provider priority for existing users.
+                effective_prov = "kimi"
+                effective_key = kimi_env
             if not effective_prov:
                 raise ValueError(
-                    "Either GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY is required"
+                    "Either GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+                    "or KIMI_API_KEY / MOONSHOT_API_KEY is required"
                 )
     else:
         spec = get_provider_spec(prov_norm)
@@ -490,14 +652,22 @@ def resolve_provider_credentials(
             effective_key = anthropic_api_key or anthropic_env
             if not effective_key:
                 raise ValueError("ANTHROPIC_API_KEY environment variable or argument is required")
+        elif effective_prov == "kimi":
+            effective_key = kimi_api_key or kimi_env
+            if not effective_key:
+                raise ValueError(
+                    "KIMI_API_KEY or MOONSHOT_API_KEY environment variable or argument is required"
+                )
         else:
             effective_key = (
                 openai_api_key
                 or gemini_api_key
                 or anthropic_api_key
+                or kimi_api_key
                 or openai_env
                 or gemini_env
                 or anthropic_env
+                or kimi_env
             )
 
     return effective_prov, effective_key
@@ -508,10 +678,12 @@ def resolve_provider(
     openai_api_key: Optional[str] = None,
     gemini_api_key: Optional[str] = None,
     anthropic_api_key: Optional[str] = None,
+    kimi_api_key: Optional[str] = None,
     model: Optional[str] = None,
     env_openai_api_key: Optional[str] = None,
     env_gemini_api_key: Optional[str] = None,
     env_anthropic_api_key: Optional[str] = None,
+    env_kimi_api_key: Optional[str] = None,
 ) -> tuple[str, Optional[str], str]:
     """
     Resolve effective provider, API key, and model.
@@ -524,9 +696,11 @@ def resolve_provider(
         openai_api_key=openai_api_key,
         gemini_api_key=gemini_api_key,
         anthropic_api_key=anthropic_api_key,
+        kimi_api_key=kimi_api_key,
         env_openai_api_key=env_openai_api_key,
         env_gemini_api_key=env_gemini_api_key,
         env_anthropic_api_key=env_anthropic_api_key,
+        env_kimi_api_key=env_kimi_api_key,
     )
 
     spec = get_provider_spec(effective_prov)

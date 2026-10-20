@@ -78,6 +78,42 @@ def get_anthropic_base_url() -> Optional[str]:
     return os.getenv("ANTHROPIC_BASE_URL") or None
 
 
+def get_kimi_api_key() -> Optional[str]:
+    """Get Kimi (Moonshot AI) API key from environment.
+
+    Checks KIMI_API_KEY first, then falls back to MOONSHOT_API_KEY.
+    """
+    return os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY")
+
+
+def get_kimi_base_url() -> Optional[str]:
+    """Get Kimi base URL override from environment."""
+    return os.getenv("KIMI_BASE_URL") or None
+
+
+def get_ado_pat() -> Optional[str]:
+    """Get Azure DevOps personal access token from environment.
+
+    Checks AZURE_DEVOPS_PAT first, then falls back to AZURE_DEVOPS_TOKEN.
+    """
+    return os.getenv("AZURE_DEVOPS_PAT") or os.getenv("AZURE_DEVOPS_TOKEN")
+
+
+def get_ado_server_url() -> Optional[str]:
+    """Get Azure DevOps Server base URL from environment."""
+    return os.getenv("AZURE_DEVOPS_SERVER_URL") or None
+
+
+def get_ado_collection() -> Optional[str]:
+    """Get default Azure DevOps collection from environment."""
+    return os.getenv("AZURE_DEVOPS_COLLECTION") or None
+
+
+def get_ado_project() -> Optional[str]:
+    """Get default Azure DevOps project from environment."""
+    return os.getenv("AZURE_DEVOPS_PROJECT") or None
+
+
 def validate_owner_repo(owner: str, repo: str) -> None:
     """Validate owner and repo names."""
     pattern = re.compile(r"^[A-Za-z0-9_.-]+$")

@@ -19,7 +19,8 @@ This enables:
 
 ## How It Works
 
-1. **Fetch PR**: Downloads the PR diff and metadata from GitHub API
+1. **Fetch PR**: Downloads the PR diff and metadata — from the GitHub API or from
+   Azure DevOps Server (on-prem) via its REST API with a PAT token
 2. **Process Diff**:
    - Redacts secrets and emails
    - Filters out binary files, lockfiles, and vendor directories
@@ -83,7 +84,7 @@ complexity-cli analyze-pr "https://github.com/owner/repo/pull/123"
 
 ### Options
 
-- `--provider`: LLM provider: `openai`, `gemini`, `anthropic`, or `auto` (default: `auto`)
+- `--provider`: LLM provider: `openai`, `gemini`, `anthropic`, `kimi`, or `auto` (default: `auto`)
 - `--prompt-file`, `-p`: Path to custom prompt file (default: embedded prompt)
 - `--model`, `-m`: Model name (default: `gpt-5.2` for OpenAI, `gemini-flash-latest` for Gemini, `claude-sonnet-4-5` for Anthropic).
   The tool sends OpenAI models with `-luna` in the name to the Responses API (`/v1/responses`),
@@ -107,11 +108,47 @@ complexity-cli analyze-pr "https://github.com/owner/repo/pull/123"
 - `OPENAI_API_KEY`: OpenAI API key
 - `GEMINI_API_KEY` or `GOOGLE_API_KEY`: Gemini / Google AI Studio API key
 - `ANTHROPIC_API_KEY`: Anthropic Claude API key
+- `KIMI_API_KEY` or `MOONSHOT_API_KEY`: Kimi / Moonshot AI API key
 - `GH_TOKEN` or `GITHUB_TOKEN` (optional): GitHub API token for private repos or higher rate limits
+- `AZURE_DEVOPS_PAT` (or `AZURE_DEVOPS_TOKEN`): Azure DevOps personal access token
+- `AZURE_DEVOPS_SERVER_URL`: Azure DevOps Server base URL (e.g. `https://tfs.company.local:8080/tfs`)
+- `AZURE_DEVOPS_COLLECTION` / `AZURE_DEVOPS_PROJECT`: defaults for batch enumeration
+
+### Azure DevOps Server (on-prem)
+
+Pull requests are auto-detected as Azure DevOps when the URL has the form
+`https://{host}[:port][/prefix]/{collection}/{project}/_git/{repo}/pullrequest/{id}`:
+
+```bash
+export AZURE_DEVOPS_PAT="your-pat"
+complexity-cli analyze-pr \
+  "https://tfs.company.local:8080/tfs/DefaultCollection/MyProject/_git/myrepo/pullrequest/123" \
+  --provider kimi
+```
+
+Notes:
+
+- Authentication uses HTTP Basic with the PAT (`base64(":<PAT>")`).
+- Azure DevOps has no single endpoint serving a whole-PR unified diff, so the
+  tool assembles the diff itself: it reads the latest PR iteration's change
+  list, fetches old/new file contents via the Git Items API, and builds a
+  unified diff locally (binary files are skipped).
+- Labeling (`label-pr`, `batch-analyze --label`) maps onto Azure DevOps PR
+  labels and requires a PAT with appropriate permissions.
+- Batch date-range enumeration (`--org/--since/--until` on GitHub) is
+  available via `--project` plus `AZURE_DEVOPS_SERVER_URL` and
+  `AZURE_DEVOPS_COLLECTION`:
+
+```bash
+complexity-cli batch-analyze \
+  --project MyProject \
+  --since 2024-01-01 --until 2024-01-31 \
+  --output results.csv
+```
 
 ### Multi-Provider Support
 
-The tool supports Google Gemini and Anthropic Claude as additional providers. The original
+The tool supports Google Gemini, Anthropic Claude, and Kimi (Moonshot AI) as additional providers. The original
 OpenAI workflow is unchanged. If you set only `OPENAI_API_KEY` (or pass `--openai-api-key`),
 the tool uses the OpenAI provider and the `gpt-5.2` model, the same behavior as before.
 
@@ -120,6 +157,7 @@ Provider auto-detection (`--provider auto`, the default) applies these rules:
 - If only `OPENAI_API_KEY` is set, the tool uses OpenAI with `gpt-5.2`.
 - If only `GEMINI_API_KEY` or `GOOGLE_API_KEY` is set, the tool uses Gemini with `gemini-flash-latest`.
 - If only `ANTHROPIC_API_KEY` is set, the tool uses Anthropic with `claude-sonnet-4-5`.
+- If only `KIMI_API_KEY` or `MOONSHOT_API_KEY` is set, the tool uses Kimi with `kimi-k2.6`.
 - If more than one key is set, the tool uses OpenAI. This is the original behavior.
 
 ```bash
@@ -135,9 +173,24 @@ complexity-cli analyze-pr "https://github.com/owner/repo/pull/123"
 export ANTHROPIC_API_KEY="your-key"
 complexity-cli analyze-pr "https://github.com/owner/repo/pull/123"
 
+# Kimi via auto-detection
+export KIMI_API_KEY="your-key"
+complexity-cli analyze-pr "https://github.com/owner/repo/pull/123" --provider kimi
+
 # Explicit provider selection
 complexity-cli analyze-pr "https://github.com/owner/repo/pull/123" --provider anthropic
 ```
+
+**Kimi notes:** Kimi's API is OpenAI-compatible and is called through
+`/v1/chat/completions`. Do not use model names containing `-luna` with a
+custom `--api-base-url` — those are routed to the Responses API, which Kimi
+does not serve. The provider disables Kimi's thinking mode (`extra_body:
+{"thinking": {"type": "disabled"}}`) because Moonshot rejects
+`tool_choice: "required"` while thinking is enabled; if structured output
+still fails, it automatically falls back to plain-text JSON parsing. The
+`KIMI_BASE_URL` environment variable is intentionally ignored (the Kimi Code
+CLI sets it to its own coding gateway); use `--api-base-url` to override the
+endpoint.
 
 ### Examples
 

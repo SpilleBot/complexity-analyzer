@@ -20,15 +20,19 @@ from .batch import (  # noqa: E402
     load_pr_urls_from_file,
     run_batch_analysis_with_labels,
 )
+from . import ado, sources  # noqa: E402
+from .sources import resolve_pr_ref  # noqa: E402
 from .config import (  # noqa: E402
+    get_ado_collection,
+    get_ado_pat,
+    get_ado_server_url,
     get_anthropic_api_key,
     get_gemini_api_key,
     get_github_token,
     get_github_tokens,
+    get_kimi_api_key,
     get_openai_api_key,
     get_openai_base_url,
-    validate_owner_repo,
-    validate_pr_number,
 )
 from .constants import (  # noqa: E402
     DEFAULT_HUNKS_PER_FILE,
@@ -44,7 +48,6 @@ from .github import (  # noqa: E402
     check_rate_limit,
     fetch_pr,
     fetch_pr_with_rotation,
-    update_complexity_label,
 )
 from .io_safety import normalize_path, write_json_atomic  # noqa: E402
 from .llm import (  # noqa: E402
@@ -56,10 +59,15 @@ from .llm import (  # noqa: E402
 from .logging_config import get_logger, setup_logging  # noqa: E402
 from .preprocess import make_prompt_input, process_diff  # noqa: E402
 from .scoring import InvalidResponseError  # noqa: E402
-from .utils import parse_pr_url  # noqa: E402
+from .utils import is_ado_pr_url  # noqa: E402
 
 # Keep regex for direct URL validation in main callback
 _OWNER_REPO_RE = re.compile(r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+
+
+def _is_supported_pr_url(url: str) -> bool:
+    """Return True for GitHub or Azure DevOps pull request URLs."""
+    return bool(_OWNER_REPO_RE.match(url.strip())) or is_ado_pr_url(url)
 
 
 class _DirectUrlGroup(TyperGroup):
@@ -71,12 +79,15 @@ class _DirectUrlGroup(TyperGroup):
     """
 
     def resolve_command(self, ctx, args):
-        if args and _OWNER_REPO_RE.match(args[0]):
+        if args and _is_supported_pr_url(args[0]):
             args = ["analyze-pr", *args]
         return super().resolve_command(ctx, args)
 
 
-app = typer.Typer(help="Analyze GitHub PR complexity using LLMs", cls=_DirectUrlGroup)
+app = typer.Typer(
+    help="Analyze pull request complexity using LLMs (GitHub and Azure DevOps)",
+    cls=_DirectUrlGroup,
+)
 
 # Initialize logger
 logger = get_logger()
@@ -98,15 +109,18 @@ def analyze_pr_to_dict(
     provider: str = "auto",
     gemini_key: Optional[str] = None,
     anthropic_key: Optional[str] = None,
+    kimi_key: Optional[str] = None,
+    ado_pat: Optional[str] = None,
+    source: str = "auto",
 ) -> dict:
     """
-    Analyze a GitHub PR and return result as dictionary.
+    Analyze a pull request (GitHub or Azure DevOps) and return result as dictionary.
 
     This is the core analysis function that can be reused by both single PR
     and batch analysis workflows.
 
     Args:
-        pr_url: GitHub PR URL
+        pr_url: GitHub or Azure DevOps PR URL
         prompt_text: Prompt text for LLM
         github_token: GitHub API token (optional, ignored if token_rotator is provided)
         openai_key: OpenAI API key (optional)
@@ -114,12 +128,16 @@ def analyze_pr_to_dict(
         timeout: Request timeout in seconds
         max_tokens: Maximum tokens for diff excerpt
         hunks_per_file: Maximum hunks per file
-        sleep_seconds: Sleep between GitHub API calls
+        sleep_seconds: Sleep between forge API calls
         progress_callback: Optional callback for progress messages (e.g., rate limit warnings)
         token_rotator: Optional TokenRotator for automatic token rotation on rate limits
         base_url: Base URL for OpenAI-compatible API
-        provider: LLM provider name ("auto", "gemini", "openai")
+        provider: LLM provider name ("auto", "gemini", "openai", "anthropic", "kimi")
         gemini_key: Gemini API key (optional)
+        anthropic_key: Anthropic API key (optional)
+        kimi_key: Kimi / Moonshot API key (optional)
+        ado_pat: Azure DevOps personal access token (optional)
+        source: Force PR source ("auto", "github", "azure-devops")
 
     Returns:
         Dict with keys: score, explanation, provider, model, tokens, timestamp,
@@ -127,7 +145,7 @@ def analyze_pr_to_dict(
 
     Raises:
         ValueError: If PR URL is invalid
-        GitHubAPIError: If GitHub API call fails
+        GitHubAPIError: If forge API call fails
         LLMError: If LLM call fails
         InvalidResponseError: If LLM response is invalid
     """
@@ -136,10 +154,12 @@ def analyze_pr_to_dict(
         openai_api_key=openai_key,
         gemini_api_key=gemini_key,
         anthropic_api_key=anthropic_key,
+        kimi_api_key=kimi_key,
         model=model,
         env_openai_api_key=get_openai_api_key(),
         env_gemini_api_key=get_gemini_api_key(),
         env_anthropic_api_key=get_anthropic_api_key(),
+        env_kimi_api_key=get_kimi_api_key(),
     )
 
     provider_inst = get_provider(
@@ -150,30 +170,37 @@ def analyze_pr_to_dict(
         base_url=base_url,
     )
 
-    # Parse PR URL
-    owner, repo, pr = parse_pr_url(pr_url)
-    validate_owner_repo(owner, repo)
-    validate_pr_number(pr)
+    # Resolve PR reference (GitHub or Azure DevOps) from the URL
+    ref = resolve_pr_ref(pr_url, source=source, ado_pat=ado_pat)
 
-    # Fetch PR - use token rotator if available, otherwise use single token
-    if token_rotator:
-        diff_text, meta = fetch_pr_with_rotation(
-            owner,
-            repo,
-            pr,
-            token_rotator,
+    # Fetch PR - use token rotator for GitHub when available
+    if ref.source == "github":
+        if token_rotator:
+            diff_text, meta = fetch_pr_with_rotation(
+                ref.owner,
+                ref.repo,
+                ref.pr,
+                token_rotator,
+                sleep_s=sleep_seconds,
+                progress_callback=progress_callback,
+                timeout=timeout,
+            )
+        else:
+            diff_text, meta = fetch_pr(
+                ref.owner,
+                ref.repo,
+                ref.pr,
+                github_token,
+                sleep_s=sleep_seconds,
+                progress_callback=progress_callback,
+            )
+    else:
+        diff_text, meta = sources.fetch_pr(
+            ref,
+            github_token=github_token,
             sleep_s=sleep_seconds,
             progress_callback=progress_callback,
             timeout=timeout,
-        )
-    else:
-        diff_text, meta = fetch_pr(
-            owner,
-            repo,
-            pr,
-            github_token,
-            sleep_s=sleep_seconds,
-            progress_callback=progress_callback,
         )
 
     title = (meta.get("title") or "").strip()
@@ -190,8 +217,8 @@ def analyze_pr_to_dict(
             "model": "sync-shortcircuit",
             "tokens": None,
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "repo": f"{owner}/{repo}",
-            "pr": pr,
+            "repo": ref.repo_slug,
+            "pr": ref.pr,
             "url": pr_url,
             "title": title,
         }
@@ -220,8 +247,8 @@ def analyze_pr_to_dict(
         "model": result.get("model", provider_inst.model_name),
         "tokens": result.get("tokens"),
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "repo": f"{owner}/{repo}",
-        "pr": pr,
+        "repo": ref.repo_slug,
+        "pr": ref.pr,
         "url": pr_url,
         "title": title,
     }
@@ -248,25 +275,37 @@ def _analyze_pr_impl(
     provider: str = "auto",
     gemini_api_key: Optional[str] = None,
     anthropic_api_key: Optional[str] = None,
+    kimi_api_key: Optional[str] = None,
+    ado_pat: Optional[str] = None,
+    source: str = "auto",
 ):
     """
-    Analyze a GitHub PR and compute complexity score.
+    Analyze a pull request (GitHub or Azure DevOps) and compute complexity score.
 
     Environment variables:
     - GH_TOKEN or GITHUB_TOKEN: GitHub API token (optional for public repos)
+    - AZURE_DEVOPS_PAT: Azure DevOps personal access token
     - OPENAI_API_KEY: OpenAI API key
     - GEMINI_API_KEY or GOOGLE_API_KEY: Gemini API key
     - ANTHROPIC_API_KEY: Anthropic API key
+    - KIMI_API_KEY or MOONSHOT_API_KEY: Kimi / Moonshot AI API key
     """
     # Set up logging if verbose
     if verbose:
         setup_logging(verbose=True)
 
     try:
-        # Parse PR URL
-        owner, repo, pr = parse_pr_url(pr_url)
-        validate_owner_repo(owner, repo)
-        validate_pr_number(pr)
+        # Resolve PR reference and validate the URL
+        ref = resolve_pr_ref(pr_url, source=source, ado_pat=ado_pat)
+        final_github_token = github_token or get_github_token()
+        final_ado_pat = ref.ado_pat
+
+        if ref.source == "azure-devops" and not final_ado_pat:
+            typer.echo("Error: Azure DevOps PAT is required for Azure DevOps PRs", err=True)
+            typer.echo(
+                "Set it with: export AZURE_DEVOPS_PAT='your-pat' or pass --ado-pat", err=True
+            )
+            raise typer.Exit(1)
 
         # Pre-flight resolution and key validation
         resolve_provider_credentials(
@@ -274,11 +313,12 @@ def _analyze_pr_impl(
             openai_api_key=openai_api_key,
             gemini_api_key=gemini_api_key,
             anthropic_api_key=anthropic_api_key,
+            kimi_api_key=kimi_api_key,
             env_openai_api_key=get_openai_api_key(),
             env_gemini_api_key=get_gemini_api_key(),
             env_anthropic_api_key=get_anthropic_api_key(),
+            env_kimi_api_key=get_kimi_api_key(),
         )
-        final_github_token = github_token or get_github_token()
 
         # Load prompt
         try:
@@ -286,16 +326,22 @@ def _analyze_pr_impl(
         except FileNotFoundError as e:
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(1)
-        # Parse PR URL for display
-        owner, repo, pr = parse_pr_url(pr_url)
 
         # Handle dry run
         if dry_run:
-            typer.echo(f"Fetching PR {owner}/{repo}#{pr}...", err=True)
+            typer.echo(f"Fetching PR {ref.repo_slug}#{ref.pr}...", err=True)
             try:
-                diff_text, meta = fetch_pr(
-                    owner, repo, pr, final_github_token, sleep_s=sleep_seconds
-                )
+                if ref.source == "github":
+                    diff_text, meta = fetch_pr(
+                        ref.owner, ref.repo, ref.pr, final_github_token, sleep_s=sleep_seconds
+                    )
+                else:
+                    diff_text, meta = sources.fetch_pr(
+                        ref,
+                        github_token=final_github_token,
+                        sleep_s=sleep_seconds,
+                        timeout=timeout,
+                    )
                 title = (meta.get("title") or "").strip()
                 typer.echo(f"PR: {title}", err=True)
                 typer.echo("Processing diff...", err=True)
@@ -308,7 +354,12 @@ def _analyze_pr_impl(
                 raise typer.Exit(0)
             except GitHubAPIError as e:
                 if e.status_code == 404:
-                    ErrorHandler.handle_github_404(owner, repo, pr, bool(final_github_token))
+                    ErrorHandler.handle_github_404(
+                        ref.owner or ref.project or "?",
+                        ref.repo or "?",
+                        ref.pr or 0,
+                        bool(final_github_token or final_ado_pat),
+                    )
                 else:
                     ErrorHandler.handle_github_error(e)
                 raise typer.Exit(1)
@@ -321,7 +372,7 @@ def _analyze_pr_impl(
                 raise typer.Exit(1)
 
         # Analyze PR
-        typer.echo(f"Fetching PR {owner}/{repo}#{pr}...", err=True)
+        typer.echo(f"Fetching PR {ref.repo_slug}#{ref.pr}...", err=True)
         try:
             output = analyze_pr_to_dict(
                 pr_url=pr_url,
@@ -330,6 +381,9 @@ def _analyze_pr_impl(
                 openai_key=openai_api_key,
                 gemini_key=gemini_api_key,
                 anthropic_key=anthropic_api_key,
+                kimi_key=kimi_api_key,
+                ado_pat=final_ado_pat,
+                source=source,
                 provider=provider,
                 model=model,
                 timeout=timeout,
@@ -344,7 +398,12 @@ def _analyze_pr_impl(
             typer.echo("Analyzing complexity with LLM...", err=True)
         except GitHubAPIError as e:
             if e.status_code == 404:
-                ErrorHandler.handle_github_404(owner, repo, pr, bool(final_github_token))
+                ErrorHandler.handle_github_404(
+                    ref.owner or ref.project or "?",
+                    ref.repo or "?",
+                    ref.pr or 0,
+                    bool(final_github_token or final_ado_pat),
+                )
             else:
                 ErrorHandler.handle_github_error(e)
             raise typer.Exit(1)
@@ -458,13 +517,16 @@ def get_pr_url_from_context() -> Optional[str]:
 @app.command(name="analyze-pr")
 def analyze_pr(
     pr_url: Optional[str] = typer.Argument(
-        None, help="GitHub PR URL. If not provided, will try to infer from GitHub Actions context."
+        None,
+        help="GitHub or Azure DevOps PR URL. If not provided, will try to infer from GitHub Actions context.",
     ),
     prompt_file: Optional[Path] = typer.Option(
         None, "--prompt-file", "-p", help="Path to custom prompt file (default: embedded prompt)"
     ),
     provider: str = typer.Option(
-        "auto", "--provider", help="LLM provider: gemini, openai, anthropic, or auto"
+        "auto",
+        "--provider",
+        help="LLM provider: gemini, openai, anthropic, kimi, or auto",
     ),
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Model name"),
     format: str = typer.Option("json", "--format", "-f", help="Output format: json or markdown"),
@@ -481,7 +543,7 @@ def analyze_pr(
         DEFAULT_HUNKS_PER_FILE, "--hunks-per-file", help="Maximum hunks per file"
     ),
     sleep_seconds: float = typer.Option(
-        DEFAULT_SLEEP_SECONDS, "--sleep-seconds", help="Sleep between GitHub API calls"
+        DEFAULT_SLEEP_SECONDS, "--sleep-seconds", help="Sleep between forge API calls"
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Fetch PR but don't call LLM"),
     gemini_api_key: Optional[str] = typer.Option(
@@ -491,13 +553,24 @@ def analyze_pr(
     anthropic_api_key: Optional[str] = typer.Option(
         None, "--anthropic-api-key", help="Anthropic API key"
     ),
+    kimi_api_key: Optional[str] = typer.Option(
+        None, "--kimi-api-key", help="Kimi / Moonshot AI API key"
+    ),
     github_token: Optional[str] = typer.Option(None, "--github-token", help="GitHub token"),
+    ado_pat: Optional[str] = typer.Option(
+        None, "--ado-pat", help="Azure DevOps personal access token (PAT)"
+    ),
+    source: str = typer.Option(
+        "auto",
+        "--source",
+        help="PR source: github, azure-devops, or auto (auto-detected from URL)",
+    ),
     api_base_url: Optional[str] = typer.Option(
         None, "--api-base-url", help="Base URL for OpenAI-compatible API endpoint"
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
 ):
-    """Analyze a GitHub PR and compute complexity score."""
+    """Analyze a GitHub or Azure DevOps PR and compute complexity score."""
     final_pr_url = pr_url
     if not final_pr_url:
         typer.echo(
@@ -524,6 +597,9 @@ def analyze_pr(
         openai_api_key=openai_api_key,
         gemini_api_key=gemini_api_key,
         anthropic_api_key=anthropic_api_key,
+        kimi_api_key=kimi_api_key,
+        ado_pat=ado_pat,
+        source=source,
         provider=provider,
         github_token=github_token,
         verbose=verbose,
@@ -609,6 +685,20 @@ def batch_analyze(
         help="Comma-separated list of GitHub tokens for rotation on rate limits. "
         "Can also be set via GH_TOKENS or GITHUB_TOKENS environment variables.",
     ),
+    ado_pat: Optional[str] = typer.Option(
+        None, "--ado-pat", help="Azure DevOps personal access token (PAT)"
+    ),
+    project: Optional[str] = typer.Option(
+        None, "--project", help="Azure DevOps project name (for date range enumeration)"
+    ),
+    source: str = typer.Option(
+        "auto",
+        "--source",
+        help="PR source: github, azure-devops, or auto (auto-detected from URLs)",
+    ),
+    kimi_api_key: Optional[str] = typer.Option(
+        None, "--kimi-api-key", help="Kimi / Moonshot AI API key"
+    ),
 ):
     """
     Batch analyze multiple PRs from a file or date range.
@@ -645,16 +735,16 @@ def batch_analyze(
             )
             raise typer.Exit(1)
 
-        if not input_file and not org:
+        if not input_file and not org and not project:
             typer.echo(
-                "Error: Must specify either --input-file OR --org (with date range options)",
+                "Error: Must specify either --input-file OR --org/--project (with date range options)",
                 err=True,
             )
             raise typer.Exit(1)
 
-        if not input_file and org and since_minutes is None and not (since and until):
+        if not input_file and (org or project) and since_minutes is None and not (since and until):
             typer.echo(
-                "Error: Must specify either --since-minutes OR (--since, --until) with --org",
+                "Error: Must specify either --since-minutes OR (--since, --until) with --org/--project",
                 err=True,
             )
             raise typer.Exit(1)
@@ -673,9 +763,11 @@ def batch_analyze(
             openai_api_key=openai_api_key,
             gemini_api_key=gemini_api_key,
             anthropic_api_key=anthropic_api_key,
+            kimi_api_key=kimi_api_key,
             env_openai_api_key=get_openai_api_key(),
             env_gemini_api_key=get_gemini_api_key(),
             env_anthropic_api_key=get_anthropic_api_key(),
+            env_kimi_api_key=get_kimi_api_key(),
         )
 
         # Get GitHub tokens - CLI option takes precedence over environment
@@ -686,6 +778,9 @@ def batch_analyze(
         else:
             # Fall back to environment variables
             token_list = get_github_tokens()
+
+        # Azure DevOps PAT (CLI option takes precedence over environment)
+        final_ado_pat = ado_pat or get_ado_pat()
 
         # Create TokenRotator if we have multiple tokens
         token_rotator: Optional[TokenRotator] = None
@@ -700,17 +795,20 @@ def batch_analyze(
         else:
             github_token = None
 
-        # GitHub token is required for labeling
-        if label and not github_token:
-            typer.echo("Error: GitHub token is required for labeling PRs", err=True)
+        # A forge token is required for labeling
+        if label and not github_token and not final_ado_pat:
+            typer.echo("Error: A forge token is required for labeling PRs", err=True)
             typer.echo(
-                "Set it with: export GH_TOKEN='your-token' or export GITHUB_TOKEN='your-token'",
+                "For GitHub: export GH_TOKEN='your-token' or export GITHUB_TOKEN='your-token'",
                 err=True,
+            )
+            typer.echo(
+                "For Azure DevOps: export AZURE_DEVOPS_PAT='your-pat' or pass --ado-pat", err=True
             )
             raise typer.Exit(1)
 
         # Warn if GitHub token is missing (needed for private repos)
-        if not github_token:
+        if not github_token and not project:
             typer.echo(
                 "Warning: GH_TOKEN or GITHUB_TOKEN not set. Private repos may fail with 404 errors.",
                 err=True,
@@ -750,15 +848,65 @@ def batch_analyze(
                     typer.echo("Error: --since date must be before --until date", err=True)
                     raise typer.Exit(1)
 
-            pr_urls = generate_pr_list_from_date_range(
-                org=org,
-                since=since_dt,
-                until=until_dt,
-                cache_file=cache_file,
-                github_token=github_token,
-                sleep_seconds=sleep_seconds,
-                state=state,
-            )
+            if project:
+                # Azure DevOps date range enumeration (needs server/collection from env)
+                ado_server = get_ado_server_url()
+                ado_collection = get_ado_collection()
+                if not ado_server:
+                    typer.echo(
+                        "Error: AZURE_DEVOPS_SERVER_URL is required for Azure DevOps enumeration",
+                        err=True,
+                    )
+                    typer.echo(
+                        "Example: export AZURE_DEVOPS_SERVER_URL='https://tfs.company.local:8080/tfs'",
+                        err=True,
+                    )
+                    raise typer.Exit(1)
+                if not ado_collection:
+                    typer.echo(
+                        "Error: AZURE_DEVOPS_COLLECTION is required for Azure DevOps enumeration",
+                        err=True,
+                    )
+                    typer.echo(
+                        "Example: export AZURE_DEVOPS_COLLECTION='DefaultCollection'", err=True
+                    )
+                    raise typer.Exit(1)
+                if not final_ado_pat:
+                    typer.echo(
+                        "Error: Azure DevOps PAT is required for date range enumeration", err=True
+                    )
+                    typer.echo(
+                        "Set it with: export AZURE_DEVOPS_PAT='your-pat' or pass --ado-pat",
+                        err=True,
+                    )
+                    raise typer.Exit(1)
+                typer.echo(
+                    f"Fetching {state} PRs for project '{project}' from "
+                    f"{since_dt.date()} to {until_dt.date()}...",
+                    err=True,
+                )
+                ado_state = "closed" if state == "closed" else "all"
+                pr_urls = ado.search_prs(
+                    server=ado_server.rstrip("/"),
+                    collection=ado_collection,
+                    project=project,
+                    since=since_dt,
+                    until=until_dt,
+                    pat=final_ado_pat,
+                    sleep_s=sleep_seconds,
+                    state=ado_state,
+                )
+                typer.echo(f"Found {len(pr_urls)} PRs", err=True)
+            else:
+                pr_urls = generate_pr_list_from_date_range(
+                    org=org,
+                    since=since_dt,
+                    until=until_dt,
+                    cache_file=cache_file,
+                    github_token=github_token,
+                    sleep_seconds=sleep_seconds,
+                    state=state,
+                )
 
         # Create analyzer function with progress callback
         def progress_msg(msg: str) -> None:
@@ -774,6 +922,9 @@ def batch_analyze(
                 openai_key=openai_api_key,
                 gemini_key=gemini_api_key,
                 anthropic_key=anthropic_api_key,
+                kimi_key=kimi_api_key,
+                ado_pat=final_ado_pat,
+                source=source,
                 provider=provider,
                 model=model,
                 timeout=timeout,
@@ -800,6 +951,7 @@ def batch_analyze(
             label_prs=label,
             label_prefix=label_prefix,
             github_token=github_token,
+            ado_pat=final_ado_pat,
             timeout=timeout,
             force=force,
         )
@@ -877,13 +1029,16 @@ def rate_limit(
 @app.command(name="label-pr")
 def label_pr(
     pr_url: Optional[str] = typer.Argument(
-        None, help="GitHub PR URL. If not provided, will try to infer from GitHub Actions context."
+        None,
+        help="GitHub or Azure DevOps PR URL. If not provided, will try to infer from GitHub Actions context.",
     ),
     prompt_file: Optional[Path] = typer.Option(
         None, "--prompt-file", "-p", help="Path to custom prompt file (default: embedded prompt)"
     ),
     provider: str = typer.Option(
-        "auto", "--provider", help="LLM provider: gemini, openai, anthropic, or auto"
+        "auto",
+        "--provider",
+        help="LLM provider: gemini, openai, anthropic, kimi, or auto",
     ),
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m", help="Model name"),
     timeout: float = typer.Option(
@@ -896,7 +1051,7 @@ def label_pr(
         DEFAULT_HUNKS_PER_FILE, "--hunks-per-file", help="Maximum hunks per file"
     ),
     sleep_seconds: float = typer.Option(
-        DEFAULT_SLEEP_SECONDS, "--sleep-seconds", help="Sleep between GitHub API calls"
+        DEFAULT_SLEEP_SECONDS, "--sleep-seconds", help="Sleep between forge API calls"
     ),
     label_prefix: str = typer.Option(
         "complexity:", "--label-prefix", help="Prefix for the complexity label"
@@ -909,22 +1064,36 @@ def label_pr(
     anthropic_api_key: Optional[str] = typer.Option(
         None, "--anthropic-api-key", help="Anthropic API key"
     ),
+    kimi_api_key: Optional[str] = typer.Option(
+        None, "--kimi-api-key", help="Kimi / Moonshot AI API key"
+    ),
     github_token: Optional[str] = typer.Option(None, "--github-token", help="GitHub token"),
+    ado_pat: Optional[str] = typer.Option(
+        None, "--ado-pat", help="Azure DevOps personal access token (PAT)"
+    ),
+    source: str = typer.Option(
+        "auto",
+        "--source",
+        help="PR source: github, azure-devops, or auto (auto-detected from URL)",
+    ),
     api_base_url: Optional[str] = typer.Option(
         None, "--api-base-url", help="Base URL for OpenAI-compatible API endpoint"
     ),
 ):
     """
-    Analyze a GitHub PR and update its complexity label.
+    Analyze a pull request and update its complexity label.
 
     Computes the complexity score and sets a label like "complexity:7" on the PR.
     Removes any existing complexity labels before adding the new one.
+    Works with both GitHub and Azure DevOps pull request URLs.
 
     Environment variables:
-    - GH_TOKEN or GITHUB_TOKEN: GitHub API token (required for label updates)
+    - GH_TOKEN or GITHUB_TOKEN: GitHub API token (required for GitHub label updates)
+    - AZURE_DEVOPS_PAT: Azure DevOps PAT (required for Azure DevOps label updates)
     - OPENAI_API_KEY: OpenAI API key
     - GEMINI_API_KEY or GOOGLE_API_KEY: Gemini API key
     - ANTHROPIC_API_KEY: Anthropic API key
+    - KIMI_API_KEY or MOONSHOT_API_KEY: Kimi / Moonshot AI API key
     """
     try:
         # Get PR URL
@@ -940,10 +1109,16 @@ def label_pr(
                 raise typer.Exit(1)
             typer.echo(f"Inferred PR URL: {final_pr_url}", err=True)
 
-        # Parse PR URL
-        owner, repo, pr = parse_pr_url(final_pr_url)
-        validate_owner_repo(owner, repo)
-        validate_pr_number(pr)
+        # Resolve PR reference (GitHub or Azure DevOps) and credentials
+        ref = resolve_pr_ref(final_pr_url, source=source, ado_pat=ado_pat)
+        final_github_token = github_token or get_github_token()
+
+        if ref.source == "azure-devops" and not ref.ado_pat:
+            typer.echo("Error: Azure DevOps PAT is required to update labels", err=True)
+            typer.echo(
+                "Set it with: export AZURE_DEVOPS_PAT='your-pat' or pass --ado-pat", err=True
+            )
+            raise typer.Exit(1)
 
         # Pre-flight resolution and key validation
         resolve_provider_credentials(
@@ -951,13 +1126,14 @@ def label_pr(
             openai_api_key=openai_api_key,
             gemini_api_key=gemini_api_key,
             anthropic_api_key=anthropic_api_key,
+            kimi_api_key=kimi_api_key,
             env_openai_api_key=get_openai_api_key(),
             env_gemini_api_key=get_gemini_api_key(),
             env_anthropic_api_key=get_anthropic_api_key(),
+            env_kimi_api_key=get_kimi_api_key(),
         )
-        final_github_token = github_token or get_github_token()
 
-        if not final_github_token:
+        if ref.source == "github" and not final_github_token:
             typer.echo("Error: GitHub token is required to update labels", err=True)
             typer.echo("Set it with: export GH_TOKEN='your-token' or pass --github-token", err=True)
             raise typer.Exit(1)
@@ -970,7 +1146,7 @@ def label_pr(
             raise typer.Exit(1)
 
         # Analyze PR
-        typer.echo(f"Analyzing PR {owner}/{repo}#{pr}...", err=True)
+        typer.echo(f"Analyzing PR {ref.repo_slug}#{ref.pr}...", err=True)
         try:
             output = analyze_pr_to_dict(
                 pr_url=final_pr_url,
@@ -979,6 +1155,9 @@ def label_pr(
                 openai_key=openai_api_key,
                 gemini_key=gemini_api_key,
                 anthropic_key=anthropic_api_key,
+                kimi_key=kimi_api_key,
+                ado_pat=ref.ado_pat,
+                source=source,
                 provider=provider,
                 model=model,
                 timeout=timeout,
@@ -990,7 +1169,12 @@ def label_pr(
 
         except GitHubAPIError as e:
             if e.status_code == 404:
-                ErrorHandler.handle_github_404(owner, repo, pr, bool(final_github_token))
+                ErrorHandler.handle_github_404(
+                    ref.owner or ref.project or "?",
+                    ref.repo or "?",
+                    ref.pr or 0,
+                    bool(final_github_token or ref.ado_pat),
+                )
             else:
                 ErrorHandler.handle_github_error(e)
             raise typer.Exit(1)
@@ -1016,12 +1200,10 @@ def label_pr(
         else:
             typer.echo("Updating PR label...", err=True)
             try:
-                label_name = update_complexity_label(
-                    owner=owner,
-                    repo=repo,
-                    pr=pr,
+                label_name = sources.update_complexity_label(
+                    ref,
                     complexity=complexity,
-                    token=final_github_token,
+                    github_token=final_github_token,
                     label_prefix=label_prefix,
                     timeout=timeout,
                 )
@@ -1035,8 +1217,8 @@ def label_pr(
             "score": complexity,
             "explanation": output["explanation"],
             "label": f"{label_prefix}{complexity}",
-            "pr": pr,
-            "repo": f"{owner}/{repo}",
+            "pr": ref.pr,
+            "repo": ref.repo_slug,
             "url": final_pr_url,
             "dry_run": dry_run,
         }
@@ -1090,9 +1272,9 @@ def main(ctx: typer.Context):
         typer.echo("   or: complexity-cli <PR_URL>", err=True)
         raise typer.Exit(1)
 
-    # Check if first arg looks like a URL
+    # Check if first arg looks like a supported PR URL
     first_arg = ctx.args[0]
-    if not _OWNER_REPO_RE.match(first_arg):
+    if not _is_supported_pr_url(first_arg):
         typer.echo(f"Error: Invalid PR URL: {first_arg}", err=True)
         typer.echo("Usage: complexity-cli analyze-pr <PR_URL>", err=True)
         typer.echo("   or: complexity-cli <PR_URL>", err=True)
