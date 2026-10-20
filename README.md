@@ -146,6 +146,80 @@ complexity-cli batch-analyze \
   --output results.csv
 ```
 
+### Утилиты командной строки для Windows (analyze.bat, check-pr.bat, label-pr.bat)
+
+В форке есть три готовых `.bat`-скрипта для работы с Azure DevOps Server через
+провайдера Kimi. Перед первым запуском задайте токены в окружении (один раз):
+
+```bat
+setx AZURE_DEVOPS_PAT "ваш_PAT_от_Azure_DevOps"
+setx KIMI_API_KEY "ваш_ключ_Kimi"
+```
+
+После `setx` откройте новое окно консоли. Пути к серверу и проекту
+при необходимости правятся в самих `.bat`-файлах
+(`AZURE_DEVOPS_SERVER_URL`, `AZURE_DEVOPS_COLLECTION`, `ADO_PROJECT`).
+Все скрипты нужно запускать из корневой папки проекта
+(там, где лежит папка `.venv`).
+
+#### 1. analyze.bat — пакетный анализ диапазона дат или один PR
+
+Диапазон дат (`SINCE`, `UNTIL`) и проект (`ADO_PROJECT`) задаются внутри файла.
+Без аргументов скрипт анализирует все PR проекта за указанный период и пишет
+результаты в `results.csv` (поддерживается прерывание и возобновление):
+
+```bat
+analyze.bat
+```
+
+С URL в аргументе — анализирует один PR:
+
+```bat
+analyze.bat "https://prm-devtfs1.itps.com/tfs/ITPS/AVIST/_git/AVIST/pullrequest/13657"
+```
+
+Только получить diff без вызова LLM (проверка доступа):
+
+```bat
+analyze.bat "https://prm-devtfs1.itps.com/tfs/ITPS/AVIST/_git/AVIST/pullrequest/13657" --dry-run
+```
+
+#### 2. check-pr.bat — проверка одного PR с сохранением результата
+
+Анализирует один PR через Kimi и сохраняет результат в CSV-файл с именем
+`result<номер_PR>.csv` в текущей папке, затем выводит содержимое файла на экран:
+
+```bat
+check-pr.bat "https://prm-devtfs1.itps.com/tfs/ITPS/AVIST/_git/AVIST/pullrequest/13657"
+```
+
+Пример вывода:
+
+```text
+=== Analyzing PR 13657 with Kimi ===
+    Result will be saved to: C:\...\complexity-analyzer\result13657.csv
+Content of result13657.csv:
+----------------------------------------
+pr_url,complexity,explanation
+https://.../pullrequest/13657,6,"Multiple modules with non-trivial control flow changes"
+----------------------------------------
+```
+
+#### 3. label-pr.bat — анализ и автоматическая метка на PR
+
+Анализирует PR и ставит на него в Azure DevOps метку вида `complexity:N`
+(требуется PAT с правом на изменение меток):
+
+```bat
+label-pr.bat "https://prm-devtfs1.itps.com/tfs/ITPS/AVIST/_git/AVIST/pullrequest/13657"
+```
+
+Показать предполагаемую метку, но не изменять PR:
+
+```bat
+label-pr.bat "https://prm-devtfs1.itps.com/tfs/ITPS/AVIST/_git/AVIST/pullrequest/13657" --dry-run
+```
+
 ### Multi-Provider Support
 
 The tool supports Google Gemini, Anthropic Claude, and Kimi (Moonshot AI) as additional providers. The original
